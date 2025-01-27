@@ -1,0 +1,7 @@
+_target_: server.Server
+name: decodingx8
+tdp: 99999999999
+processors:
+  - name: Decoding_66core
+    count: 8
+interconnects: {}

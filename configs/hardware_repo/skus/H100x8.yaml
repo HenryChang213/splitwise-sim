@@ -1,0 +1,7 @@
+_target_: server.Server
+name: H100x8
+tdp: 10200
+processors:
+  - name: H100
+    count: 8
+interconnects: {}

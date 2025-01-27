@@ -1,0 +1,13 @@
+power_budget: 9999999999
+
+servers:
+  - sku: prefillx8
+    count: 8
+  - sku: decodingx8
+    count: 8
+  - sku: H100x8
+    count: 4
+
+interconnects:
+  - link: infiniband
+    topology: p2p

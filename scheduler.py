@@ -219,6 +219,9 @@ class KVScheduler(Scheduler):
         elif instance.tag == "token":
             self.token_instances.append(instance)
         else:
+            raise ValueError(
+                f"Unsupported instance type: {instance.processors[0].name}"
+            )
             # alternative way to distinguish instances
             if isinstance(self.prompt_processors, list):
                 if instance.name in self.prompt_processors:
@@ -680,14 +683,14 @@ class MixedPoolScheduler(KVScheduler):
         for instances in [self.prompt_instances, self.mixed_instances]:
             prompt_instance = self.find_best_prompt_instance(instances, prompt_task)
             if prompt_instance is not None:
-                #print("Found prompt in prompt+mixed", clock(), request.request_id)
+                # print("Found prompt in prompt+mixed", clock(), request.request_id)
                 break
 
         token_instance = None
         for instances in [self.token_instances, self.mixed_instances]:
             token_instance = self.find_best_token_instance(instances, prompt_task, token_task)
             if token_instance is not None:
-                #print("Found token in token+mixed", clock(), request.request_id)
+                # print("Found token in token+mixed", clock(), request.request_id)
                 break
 
         if prompt_instance is None and len(self.token_instances) > 0:
@@ -728,6 +731,243 @@ class MixedPoolScheduler(KVScheduler):
             token_task.instance = token_instance
             prompt_instance.sched_memory += prompt_task.max_memory(prompt_instance) + \
                                             token_task.max_memory(prompt_instance)
+            prompt_task.chain = [token_task]
+
+        # bookkeeping
+        prompt_instance.sched_pending_tokens += prompt_task.prompt_size
+        token_instance.sched_pending_tokens += 1
+
+
+# TODO: implement FixedPoolScheduler
+class FixedPoolScheduler(KVScheduler):
+    """
+    MixedPoolScheduler schedules Requests to the Instance with smallest pending tokens queue.
+    Always ships KV-caches from the prompt to the token instances.
+    Currently uses an inefficient O(n) search.
+    """
+
+    def __init__(
+        self,
+        application,
+        router,
+        overheads,
+        executor_overheads,
+        prompt_processors,
+        token_processors,
+        prompt_max_pending_batch_tokens,
+        token_max_pending_batch_tokens,
+        transfer_bandwidth,
+        debug=False,
+    ):
+        super().__init__(
+            application,
+            router,
+            overheads,
+            executor_overheads,
+            prompt_processors,
+            token_processors,
+            debug,
+        )
+        self.prompt_max_pending_batch_tokens = prompt_max_pending_batch_tokens
+        self.token_max_pending_batch_tokens = token_max_pending_batch_tokens
+        self.transfer_bandwidth = transfer_bandwidth * 1024**3  # convert to B/s
+        self.prompt_instances = []
+        self.mixed_instances = []
+        self.token_instances = []
+
+    def add_instance(self, instance):
+        """
+        Tracks prompt and token instances differently.
+        NOTE: assumes instance tags are distinguishers, not h/w itself
+        TODO: make this more flexible and robust
+        """
+        self.instances.append(instance)
+        if instance.tag == "prompt":
+            self.prompt_instances.append(instance)
+        elif instance.tag == "token":
+            self.token_instances.append(instance)
+        elif instance.tag == "mixed":
+            self.mixed_instances.append(instance)
+        else:
+            raise ValueError(
+                f"Unsupported instance type: {instance.processors[0].name}"
+            )
+            # alternative way to distinguish instances
+            if isinstance(self.prompt_processors, list):
+                if instance.name in self.prompt_processors:
+                    self.prompt_instances.append(instance)
+                elif instance.name in self.token_processors:
+                    self.token_instances.append(instance)
+                else:
+                    raise ValueError(
+                        f"Unsupported instance type: \
+                                        {instance.processors[0].name}"
+                    )
+
+    def is_memory_loaded(self, instance, tasks):
+        """
+        Check if instance is loaded by task
+        """
+        request_memory = sum(task.max_memory(instance) for task in tasks)
+        if instance.sched_memory + request_memory >= instance.max_memory:
+            return True
+        return False
+
+    def is_queue_long(self, instance, task):
+        """
+        Check if prompt queue is long
+        """
+        if (
+            len(instance.pending_queue) > 0
+            and instance.sched_pending_tokens + task.tokens_per_iteration
+            > self.prompt_max_pending_batch_tokens
+        ):
+            return True
+        return False
+
+    def find_best_prompt_instance(self, instances, prompt_task):
+        """
+        Check if prompt queue is long
+        """
+        if len(instances) == 0:
+            return None
+        prompt_instance = min(
+            instances, key=lambda instance: instance.sched_pending_tokens
+        )
+        if self.is_queue_long(prompt_instance, prompt_task):
+            return None
+        return prompt_instance
+
+    def find_best_token_instance(self, instances, prompt_task, token_task):
+        """
+        Checks if instance memory is full
+        """
+        if len(instances) == 0:
+            return None
+        token_instance = min(instances, key=lambda instance: (instance.sched_memory))
+        if self.is_memory_loaded(token_instance, [prompt_task, token_task]):
+            return None
+        return token_instance
+
+    def notify_free_instance(self, instance):
+        """
+        Notifies that a mixed instance is free; moves it to appropriate pool
+        """
+
+        # TODO: FixedPoolScheduler does not move instances between pools
+        return
+        if instance.sched_tag == "mixed":
+            instance.sched_tag = None
+            self.mixed_instances.remove(instance)
+            if instance.tag == "prompt":
+                self.prompt_instances.append(instance)
+            elif instance.tag == "token":
+                self.token_instances.append(instance)
+            else:
+                raise ValueError(
+                    f"Unsupported instance tag: {instance.tag} on \
+                    {instance.name}_{instance.instance_id}"
+                )
+
+    def schedule(self, request, *args, **kwargs):
+        """
+        Assigns each to the least loaded instance (by queue length)
+        """
+        if (len(self.prompt_instances) == 0 or len(self.token_instances) == 0) and len(
+            self.mixed_instances
+        ) == 0:
+            raise ValueError("No instances available")
+
+        prompt_task = request.root_node
+        token_task = next(request.successors(prompt_task))
+
+        # print(f"prompt_instances: {len(self.prompt_instances)}")
+        # print(f"token_instances: {len(self.token_instances)}")
+        # print(f"mixed_instances: {len(self.mixed_instances)}")
+
+        prompt_instance = None
+        for instances in [self.prompt_instances, self.mixed_instances]:
+            prompt_instance = self.find_best_prompt_instance(instances, prompt_task)
+
+            if prompt_instance is not None:
+                # print("Found prompt in prompt+mixed", clock(), request.request_id)
+                break
+
+        token_instance = None
+        for instances in [self.token_instances, self.mixed_instances]:
+            token_instance = self.find_best_token_instance(
+                instances, prompt_task, token_task
+            )
+            if token_instance is not None:
+                # print("Found token in token+mixed", clock(), request.request_id)
+                break
+
+        # TODO: FixedPoolScheduler does not move instances between pools
+        # if prompt_instance is None and len(self.token_instances) > 0:
+        #     # take an instance from token instances and add to mixed instances
+        #     prompt_instance = min(self.token_instances,
+        #                           key=lambda instance: instance.sched_pending_tokens)
+        #     self.token_instances.remove(prompt_instance)
+        #     self.mixed_instances.append(prompt_instance)
+        #     prompt_instance.sched_tag = "mixed"
+
+        # if token_instance is None and len(self.prompt_instances) > 0:
+        #     # take an instance from prompt instances and add to mixed instances
+        #     token_instance = min(self.prompt_instances,
+        #                          key=lambda instance: (instance.sched_memory))
+        #     self.prompt_instances.remove(token_instance)
+        #     self.mixed_instances.append(token_instance)
+        #     token_instance.sched_tag = "mixed"
+
+        # if we didn't find any instance still, devolve to baseline mixed batching
+        if prompt_instance is None or token_instance is None:
+            # # Option 1
+            # all_instances = (
+            #     self.prompt_instances + self.mixed_instances + self.token_instances
+            # )
+
+            # prompt_instance = min(
+            #     all_instances, key=lambda instance: instance.sched_pending_tokens
+            # )
+            # token_instance = prompt_instance
+
+            # # Option 2
+            prompt_instance = min(
+                self.prompt_instances + self.mixed_instances,
+                key=lambda instance: instance.sched_pending_tokens,
+            )
+            token_instance = min(
+                self.token_instances + self.mixed_instances,
+                key=lambda instance: instance.sched_pending_tokens,
+            )
+
+            # Option 3
+            # prompt_instance = min(
+            #     self.prompt_instances,
+            #     key=lambda instance: instance.sched_pending_tokens,
+            # )
+            # token_instance = min(
+            #     self.token_instances + self.mixed_instances,
+            #     key=lambda instance: instance.sched_pending_tokens,
+            # )
+
+        if prompt_instance != token_instance:
+            # print(f"kv cache transfer: {prompt_instance.name} -> {token_instance.name}")
+            # ship KV-cache between instances
+            self.add_kv_cache_transfer(
+                request, prompt_instance, token_instance, self.transfer_bandwidth
+            )
+            prompt_instance.sched_memory += prompt_task.max_memory(prompt_instance)
+            token_instance.sched_memory += prompt_task.max_memory(
+                token_instance
+            ) + token_task.max_memory(token_instance)
+        else:
+            # run on same instance
+            prompt_task.instance = prompt_instance
+            token_task.instance = token_instance
+            prompt_instance.sched_memory += prompt_task.max_memory(
+                prompt_instance
+            ) + token_task.max_memory(prompt_instance)
             prompt_task.chain = [token_task]
 
         # bookkeeping

@@ -5,7 +5,7 @@ servers:
     count: 0
   - sku: dgx-h100
     #count: 800
-    count: 40
+    count: 30
 
 interconnects:
   - link: infiniband

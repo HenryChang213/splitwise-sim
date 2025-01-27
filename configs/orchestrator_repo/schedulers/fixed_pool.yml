@@ -1,0 +1,11 @@
+_target_: scheduler.FixedPoolScheduler
+overheads: {}
+executor_overheads:
+  submit_task: 0
+  submit_flow: 0
+  finish_request: 0
+prompt_processors: []
+token_processors: []
+prompt_max_pending_batch_tokens: 8192
+token_max_pending_batch_tokens: 2048
+transfer_bandwidth: 200

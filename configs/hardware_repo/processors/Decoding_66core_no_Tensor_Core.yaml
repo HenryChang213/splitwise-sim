@@ -1,0 +1,3 @@
+_target_: processor.GPU
+name: Decoding_66corex8_no_Tensor_Core
+memory_size: 80e9

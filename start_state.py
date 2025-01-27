@@ -63,6 +63,8 @@ def splitwise(start_state_cfg, cluster, applications, **kwargs):
                                          tensor_parallelism=token_cfg.tensor_parallelism)
 
     split_type = start_state_cfg.split_type
+    
+    # print(f'servers: {servers}')
 
     if split_type == "homogeneous":
         n_prompts = prompt_cfg.num_instances
@@ -107,3 +109,74 @@ def splitwise(start_state_cfg, cluster, applications, **kwargs):
                                                          tag="token")
                 else:
                     raise ValueError(f"Unsupported sku_name: {sku_name}")
+    
+    # TODO: initialize three pools of instances
+    if split_type == "heterogeneous-fixed-pool":
+        prompt_instances = prompt_cfg.instance_names
+        token_instances = token_cfg.instance_names
+        mixed_cfg = start_state_cfg.mixed
+        mixed_instances = mixed_cfg.instance_names
+        
+        mixed_parallelism = ModelParallelism(pipeline_parallelism=mixed_cfg.pipeline_parallelism,tensor_parallelism=mixed_cfg.tensor_parallelism)
+        
+        for sku_name in servers:
+            for server in servers[sku_name]:
+                if sku_name in prompt_instances:
+                    # allocate as many prompt instances as possible
+                    for proc_id in range(0, len(server.processors), prompt_parallelism.tensor_parallelism):
+                        allocator.start_spin_up_instance(instance_cfg=prompt_cfg,
+                                                         processors=server.processors[proc_id:proc_id+prompt_parallelism.tensor_parallelism],
+                                                         parallelism=prompt_parallelism,
+                                                         pre_start=True,
+                                                         tag="prompt")
+                elif sku_name in token_instances:
+                    # allocate as many token instances as possible
+                    for proc_id in range(0, len(server.processors), token_parallelism.tensor_parallelism):
+                        allocator.start_spin_up_instance(instance_cfg=token_cfg,
+                                                         processors=server.processors[proc_id:proc_id+token_parallelism.tensor_parallelism],
+                                                         parallelism=token_parallelism,
+                                                         pre_start=True,
+                                                         tag="token")
+                elif sku_name in mixed_instances:
+                    for proc_id in range(0, len(server.processors), mixed_parallelism.tensor_parallelism):
+                        allocator.start_spin_up_instance(instance_cfg=mixed_cfg,
+                                                         processors=server.processors[proc_id:proc_id+mixed_parallelism.tensor_parallelism],
+                                                         parallelism=mixed_parallelism,
+                                                         pre_start=True,
+                                                         tag="mixed")
+                
+                else:
+                    raise ValueError(f"Unsupported sku_name: {sku_name}")
+
+    if split_type == "homogeneous-fixed-pool":
+        n_prompts = prompt_cfg.num_instances
+        n_tokens = token_cfg.num_instances
+        mixed_cfg = start_state_cfg.mixed
+        mixed_instances = mixed_cfg.instance_names
+        n_mixed = mixed_cfg.num_instances
+        
+        mixed_parallelism = ModelParallelism(pipeline_parallelism=mixed_cfg.pipeline_parallelism,tensor_parallelism=mixed_cfg.tensor_parallelism)
+        
+        # allocate n_prompt instance of prompt
+        all_servers = [server for sku_name in servers for server in servers[sku_name]]
+        for server in all_servers[:n_prompts]:
+            for proc_id in range(0, len(server.processors), prompt_parallelism.tensor_parallelism):
+                allocator.start_spin_up_instance(instance_cfg=prompt_cfg,
+                                                 processors=server.processors[proc_id:proc_id+prompt_parallelism.tensor_parallelism],
+                                                 parallelism=prompt_parallelism,
+                                                 pre_start=True,
+                                                 tag="prompt")
+        for server in all_servers[n_prompts:n_prompts+n_tokens]:
+            for proc_id in range(0, len(server.processors), token_parallelism.tensor_parallelism):
+                allocator.start_spin_up_instance(instance_cfg=token_cfg,
+                                                 processors=server.processors[proc_id:proc_id+token_parallelism.tensor_parallelism],
+                                                 parallelism=token_parallelism,
+                                                 pre_start=True,
+                                                 tag="token")
+        for server in all_servers[n_prompts+n_tokens:n_prompts+n_tokens+n_mixed]:
+            for proc_id in range(0, len(server.processors), mixed_parallelism.tensor_parallelism):
+                allocator.start_spin_up_instance(instance_cfg=mixed_cfg,
+                                                 processors=server.processors[proc_id:proc_id+mixed_parallelism.tensor_parallelism],
+                                                 parallelism=mixed_parallelism,
+                                                 pre_start=True,
+                                                 tag="mixed")

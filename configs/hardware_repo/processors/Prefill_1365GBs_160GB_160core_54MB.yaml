@@ -1,0 +1,3 @@
+_target_: processor.GPU
+name: Prefill_1365GBs_160GB_160core_54MBx8
+memory_size: 160e9

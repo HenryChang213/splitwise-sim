@@ -1,0 +1,3 @@
+_target_: performance_model.DatabasePerformanceModelLLMCompass
+
+db_path: data/perf_model/

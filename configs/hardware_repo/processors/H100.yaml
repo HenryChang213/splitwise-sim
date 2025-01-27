@@ -1,0 +1,3 @@
+_target_: processor.GPU
+name: H100x8
+memory_size: 80e9

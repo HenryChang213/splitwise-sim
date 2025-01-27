@@ -7,6 +7,7 @@ import pandas as pd
 
 from hydra.utils import get_original_cwd
 from scipy.interpolate import interp1d
+import numpy as np
 
 from task import TaskType, PromptTask, TokenTask
 
@@ -268,3 +269,259 @@ def get_iteration_duration(*args, **kwargs):
     Returns the execution time of a contiguous iteration.
     """
     return performance_model.get_iteration_duration(*args, **kwargs)
+
+
+class DatabasePerformanceModelLLMCompass(PerformanceModel):
+    """
+    PerformanceModel based on a CSV database of characterization runs.
+    Interpolates between data points and updates the database correspondingly.
+    The underlying predictor could be changed for different interpolation strategies.
+    """
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db = {
+            "prompt": pd.read_csv(
+                os.path.join(get_original_cwd(), db_path, "results_prefill.csv"),
+                dtype={"model": "category", "hardware": "category"},
+            ),
+            "token": pd.read_csv(
+                os.path.join(get_original_cwd(), db_path, "results_decoding.csv"),
+                dtype={"model": "category", "hardware": "category"},
+            ),
+        }
+
+        # ensure the database has the correct columns
+        # and remove extraneous columns
+        self.db["prompt"] = self.db["prompt"][
+            [
+                "model",
+                "hardware",
+                "tp",
+                "batch_size",
+                "prompt_size",
+                "prompt_time",
+                "layer_time",
+                "BatchedMatmul",
+                "Softmax",
+            ]
+        ]
+        self.db["prompt"]["layer_count"] = (
+            self.db["prompt"]["prompt_time"] / self.db["prompt"]["layer_time"]
+        ).round()
+        self.db["token"] = self.db["token"][
+            [
+                "model",
+                "hardware",
+                "tp",
+                "batch_size",
+                "prompt_plus_token_size",
+                "token_time",
+                "layer_time",
+                "BatchedMatmul",
+                "Softmax",
+            ]
+        ]
+        self.db["token"]["layer_count"] = (
+            self.db["token"]["token_time"] / self.db["token"]["layer_time"]
+        ).round()
+        assert (
+            self.db["prompt"]["layer_count"].min()
+            == self.db["prompt"]["layer_count"].max()
+        )
+        assert (
+            self.db["token"]["layer_count"].min()
+            == self.db["token"]["layer_count"].max()
+        )
+        self.db["prompt"]["attention_time"] = (
+            self.db["prompt"]["BatchedMatmul"] + self.db["prompt"]["Softmax"]
+        ) * self.db["prompt"]["layer_count"]
+        self.db["prompt"]["linear_time"] = (
+            self.db["prompt"]["prompt_time"] - self.db["prompt"]["attention_time"]
+        )
+        self.db["token"]["attention_time"] = (
+            self.db["token"]["BatchedMatmul"] + self.db["token"]["Softmax"]
+        ) * self.db["token"]["layer_count"]
+        self.db["token"]["linear_time"] = (
+            self.db["token"]["token_time"] - self.db["token"]["attention_time"]
+        )
+
+        self.init_predictor()
+
+    def init_predictor(self):
+        """
+        Predict using number of tokens in the batch.
+        """
+        self.prompt_time_predictors = {}
+        self.token_time_predictors = {}
+        self.prompt_time_cache = {}
+        self.token_time_cache = {}
+
+        # prompt time predictor
+        for model in self.db["prompt"]["model"].unique():
+            for hardware in self.db["prompt"]["hardware"].unique():
+                for tensor_parallel in self.db["prompt"]["tp"].unique():
+                    mask = (
+                        (self.db["prompt"]["model"] == model)
+                        & (self.db["prompt"]["hardware"] == hardware)
+                        & (self.db["prompt"]["tp"] == tensor_parallel)
+                    )
+                    db_subset = self.db["prompt"][mask].copy()
+                    if len(db_subset) == 0:
+                        continue
+
+                    db_subset["b_s_s"] = (
+                        db_subset["batch_size"]
+                        * db_subset["prompt_size"]
+                        * db_subset["prompt_size"]
+                    )
+                    db_subset["b_s"] = (
+                        db_subset["batch_size"] * db_subset["prompt_size"]
+                    )
+
+                    self.prompt_time_predictors[(model, hardware, tensor_parallel)] = {
+                        "attention": interp1d(
+                            db_subset[["b_s_s", "attention_time"]]
+                            .groupby("b_s_s")
+                            .median()
+                            .index,
+                            db_subset[["b_s_s", "attention_time"]]
+                            .groupby("b_s_s")
+                            .median()["attention_time"],
+                            kind="linear",
+                            fill_value=np.nan,
+                        ),
+                        "linear": interp1d(
+                            db_subset[["b_s", "linear_time"]]
+                            .groupby("b_s")
+                            .median()
+                            .index,
+                            db_subset[["b_s", "linear_time"]]
+                            .groupby("b_s")
+                            .median()["linear_time"],
+                            kind="linear",
+                            fill_value=np.nan,
+                        ),
+                    }
+
+        # token time predictor
+        for model in self.db["token"]["model"].unique():
+            for hardware in self.db["token"]["hardware"].unique():
+                for tensor_parallel in self.db["token"]["tp"].unique():
+                    mask = (
+                        (self.db["token"]["model"] == model)
+                        & (self.db["token"]["hardware"] == hardware)
+                        & (self.db["token"]["tp"] == tensor_parallel)
+                    )
+                    db_subset = self.db["token"][mask].copy()
+                    if len(db_subset) == 0:
+                        continue
+
+                    db_subset["b_s"] = (
+                        db_subset["batch_size"] * db_subset["prompt_plus_token_size"]
+                    )
+
+                    self.token_time_predictors[(model, hardware, tensor_parallel)] = {
+                        "attention": interp1d(
+                            db_subset[["b_s", "attention_time"]]
+                            .groupby("b_s")
+                            .median()
+                            .index,
+                            db_subset[["b_s", "attention_time"]]
+                            .groupby("b_s")
+                            .median()["attention_time"],
+                            kind="linear",
+                            fill_value="extrapolate",
+                        ),
+                        "linear": interp1d(
+                            db_subset[["batch_size", "linear_time"]]
+                            .groupby("batch_size")
+                            .median()
+                            .index,
+                            db_subset[["batch_size", "linear_time"]]
+                            .groupby("batch_size")
+                            .median()["linear_time"],
+                            kind="linear",
+                            fill_value="extrapolate",
+                        ),
+                    }
+
+    def _match(self, stage: str, **kwargs):
+        """
+        Returns a boolean mask for the database from kwargs.
+        """
+        mask = True
+        for k, v in kwargs.items():
+            mask &= self.db[stage][k] == v
+        return mask
+
+    def get_duration(self, task, batch, instance, *args, **kwargs):
+        """
+        Returns the execution time of the task.
+        """
+        raise NotImplementedError
+
+    def get_iteration_duration(self, batch, instance, *args, **kwargs):
+        """
+        Note: assumes that prompts are always processed fully.
+        i.e., we currently do not support prompt chunking.
+        """
+        model = instance.model.name
+        hardware = instance.processors[0].name
+        tensor_parallel = instance.model.parallelism.tensor_parallelism
+
+        prompt_tasks = []
+        token_tasks = []
+        prompt_b_s_s = 0  # for prompt attention
+        prompt_b_s = 0  # for prompt linear
+        token_b_s = 0  # for token attention
+        token_b = 0  # for token linear
+        for task in batch:
+            if isinstance(task, PromptTask):
+                prompt_tasks.append(task)
+                prompt_b_s_s += task.request.prompt_size * task.request.prompt_size
+                prompt_b_s += task.request.prompt_size
+            elif isinstance(task, TokenTask):
+                token_tasks.append(task)
+                token_b_s += task.request.processed_tokens
+                token_b += 1
+            else:
+                raise NotImplementedError
+
+        iteration_time = 0
+
+        predictors_key = (model, hardware, tensor_parallel)
+
+        if prompt_b_s > 0 and token_b_s > 0:
+            # print(
+            #     f"prompt_b_s_s: {prompt_b_s_s}, prompt_b_s: {prompt_b_s}, token_b_s: {token_b_s}, token_b: {token_b}"
+            # )
+            iteration_time = (
+                float(
+                    self.prompt_time_predictors[predictors_key]["attention"](
+                        prompt_b_s_s
+                    )
+                )
+                + float(
+                    self.prompt_time_predictors[predictors_key]["linear"](
+                        prompt_b_s + token_b
+                    )
+                )
+                + float(
+                    self.token_time_predictors[predictors_key]["attention"](token_b_s)
+                )
+            )
+
+        elif prompt_b_s > 0:
+            iteration_time = float(
+                self.prompt_time_predictors[predictors_key]["attention"](prompt_b_s_s)
+            ) + float(self.prompt_time_predictors[predictors_key]["linear"](prompt_b_s))
+
+        elif token_b_s > 0:
+
+            iteration_time = float(
+                self.token_time_predictors[predictors_key]["attention"](token_b_s)
+            ) + float(self.token_time_predictors[predictors_key]["linear"](token_b))
+
+        assert iteration_time > 0, len(batch)
+        return iteration_time

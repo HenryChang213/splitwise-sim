@@ -148,6 +148,10 @@ class TraceSimulator(Simulator):
 
         # save summary results
         utils.save_dict_as_csv(summary_results, "summary.csv")
+        
+        import pprint
+        pp = pprint.PrettyPrinter(indent=0)
+        pp.pprint(summary_results)
 
         if detailed:
             # create a dataframe of all requests, save as csv

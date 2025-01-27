@@ -1,0 +1,7 @@
+_target_: server.Server
+name: prefillx8
+tdp: 99999999999
+processors:
+  - name: Prefill_1365GBs_160GB_160core_54MB
+    count: 8
+interconnects: {}
