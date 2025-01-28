@@ -486,6 +486,7 @@ class ORCAInstance(Instance):
                              len(self.pending_requests),
                              len(self.blocked_queue))
                 self.application.scheduler.notify_busy_instance(self)
+                self.application.scheduler.print_instance_states()
             else:
                 self.application.scheduler.notify_free_instance(self)
             return

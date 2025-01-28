@@ -6,7 +6,8 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 from hydra.utils import get_original_cwd
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, LinearNDInterpolator
+from collections import Counter
 import numpy as np
 
 from task import TaskType, PromptTask, TokenTask
@@ -381,24 +382,14 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
 
                     self.prompt_time_predictors[(model, hardware, tensor_parallel)] = {
                         "attention": interp1d(
-                            db_subset[["b_s_s", "attention_time"]]
-                            .groupby("b_s_s")
-                            .median()
-                            .index,
-                            db_subset[["b_s_s", "attention_time"]]
-                            .groupby("b_s_s")
-                            .median()["attention_time"],
+                            db_subset["b_s_s"],
+                            db_subset["attention_time"],
                             kind="linear",
                             fill_value=np.nan,
                         ),
                         "linear": interp1d(
-                            db_subset[["b_s", "linear_time"]]
-                            .groupby("b_s")
-                            .median()
-                            .index,
-                            db_subset[["b_s", "linear_time"]]
-                            .groupby("b_s")
-                            .median()["linear_time"],
+                            db_subset["b_s"],
+                            db_subset["linear_time"],
                             kind="linear",
                             fill_value=np.nan,
                         ),
@@ -422,27 +413,27 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
                     )
 
                     self.token_time_predictors[(model, hardware, tensor_parallel)] = {
-                        "attention": interp1d(
-                            db_subset[["b_s", "attention_time"]]
-                            .groupby("b_s")
-                            .median()
-                            .index,
-                            db_subset[["b_s", "attention_time"]]
-                            .groupby("b_s")
-                            .median()["attention_time"],
-                            kind="linear",
-                            fill_value="extrapolate",
+                        "attention": LinearNDInterpolator(
+                            list(
+                                zip(
+                                    db_subset["batch_size"],
+                                    db_subset["prompt_plus_token_size"],
+                                )
+                            ),
+                            db_subset["attention_time"],
+                            fill_value=np.nan,
                         ),
+                        # "attention": interp1d(
+                        #     db_subset["b_s"],
+                        #     db_subset["attention_time"],
+                        #     kind="linear",
+                        #     fill_value=np.nan,
+                        # ),
                         "linear": interp1d(
-                            db_subset[["batch_size", "linear_time"]]
-                            .groupby("batch_size")
-                            .median()
-                            .index,
-                            db_subset[["batch_size", "linear_time"]]
-                            .groupby("batch_size")
-                            .median()["linear_time"],
+                            db_subset["batch_size"],
+                            db_subset["linear_time"],
                             kind="linear",
-                            fill_value="extrapolate",
+                            fill_value=np.nan,
                         ),
                     }
 
@@ -476,6 +467,7 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
         prompt_b_s = 0  # for prompt linear
         token_b_s = 0  # for token attention
         token_b = 0  # for token linear
+        token_s_list = []
         for task in batch:
             if isinstance(task, PromptTask):
                 prompt_tasks.append(task)
@@ -485,6 +477,7 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
                 token_tasks.append(task)
                 token_b_s += task.request.processed_tokens
                 token_b += 1
+                token_s_list.append(task.request.processed_tokens)
             else:
                 raise NotImplementedError
 
@@ -493,24 +486,31 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
         predictors_key = (model, hardware, tensor_parallel)
 
         if prompt_b_s > 0 and token_b_s > 0:
-            # print(
-            #     f"prompt_b_s_s: {prompt_b_s_s}, prompt_b_s: {prompt_b_s}, token_b_s: {token_b_s}, token_b: {token_b}"
-            # )
-            iteration_time = (
-                float(
-                    self.prompt_time_predictors[predictors_key]["attention"](
-                        prompt_b_s_s
-                    )
-                )
-                + float(
-                    self.prompt_time_predictors[predictors_key]["linear"](
-                        prompt_b_s + token_b
-                    )
-                )
-                + float(
-                    self.token_time_predictors[predictors_key]["attention"](token_b_s)
+            iteration_time = float(
+                self.prompt_time_predictors[predictors_key]["attention"](prompt_b_s_s)
+            ) + float(
+                self.prompt_time_predictors[predictors_key]["linear"](
+                    prompt_b_s + token_b
                 )
             )
+
+            # iteration_time += float(
+            #     self.token_time_predictors[predictors_key]["attention"](token_b_s)
+            # )
+
+            iteration_time += float(
+                self.token_time_predictors[predictors_key]["attention"](
+                    token_b, token_b_s / token_b
+                )
+            )
+
+            # counts = Counter(token_s_list)
+            # for token_s, count in counts.items():
+            #     iteration_time += float(
+            #         self.token_time_predictors[predictors_key]["attention"](
+            #             count, token_s
+            #         )
+            #     )
 
         elif prompt_b_s > 0:
             iteration_time = float(
@@ -520,8 +520,27 @@ class DatabasePerformanceModelLLMCompass(PerformanceModel):
         elif token_b_s > 0:
 
             iteration_time = float(
-                self.token_time_predictors[predictors_key]["attention"](token_b_s)
-            ) + float(self.token_time_predictors[predictors_key]["linear"](token_b))
+                self.token_time_predictors[predictors_key]["linear"](token_b)
+            )
 
-        assert iteration_time > 0, len(batch)
+            # iteration_time += float(
+            #     self.token_time_predictors[predictors_key]["attention"](token_b_s)
+            # )
+            iteration_time += float(
+                self.token_time_predictors[predictors_key]["attention"](
+                    token_b, token_b_s / token_b
+                )
+            )
+
+            # counts = Counter(token_s_list)
+            # for token_s, count in counts.items():
+            #     iteration_time += float(
+            #         self.token_time_predictors[predictors_key]["attention"](
+            #             count, token_s
+            #         )
+            #     )
+
+        assert (
+            iteration_time > 0
+        ), f"iteration_time: {iteration_time}, prompt_b_s_s: {prompt_b_s_s}, prompt_b_s: {prompt_b_s}, token_b_s: {token_b_s}, token_b: {token_b}, token_s_list: {Counter(token_s_list)}"
         return iteration_time

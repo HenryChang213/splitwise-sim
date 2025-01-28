@@ -10,7 +10,7 @@ prompt:
   max_preemptions: 4
   pipeline_parallelism: 1
   tensor_parallelism: 8
-  num_instances: 12
+  num_instances: 8
   instance_names: ["H100x8"]
 token:
   instance_type: Splitwise
@@ -19,7 +19,7 @@ token:
   max_preemptions: 4
   pipeline_parallelism: 1
   tensor_parallelism: 8
-  num_instances: 4
+  num_instances: 8
   instance_names: ["H100x8"]
 mixed:
   instance_type: Splitwise

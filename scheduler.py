@@ -52,6 +52,18 @@ class Scheduler(ABC):
         self.scheduler_logger = utils.file_logger(logger_name, level=level)
         self.scheduler_logger.info("time,action,info")
 
+    def print_instance_states(self):
+        """
+        Print the state of all instances
+        """
+
+        print(
+            "instance name, sched_pending_tokens, sched_memory, pending_requests, batch"
+        )
+        for instance in self.instances:
+            print(
+                f"{instance.name}_{instance.instance_id}_{instance.tag}: {instance.sched_pending_tokens}, {instance.sched_memory/1e9:.1f}GB, {len(instance.pending_requests)}, {len(instance.batch)}, {instance.max_memory/1e9:.1f}GB"
+            )
 
     @property
     def application(self):
@@ -973,3 +985,5 @@ class FixedPoolScheduler(KVScheduler):
         # bookkeeping
         prompt_instance.sched_pending_tokens += prompt_task.prompt_size
         token_instance.sched_pending_tokens += 1
+
+        # self.print_instance_states()
